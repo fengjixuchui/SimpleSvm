@@ -24,7 +24,8 @@ _sgdt (
     _Out_ PVOID Descriptor
     );
 
-_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
 _IRQL_requires_same_
 DECLSPEC_NORETURN
 EXTERN_C
@@ -187,7 +188,8 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
         DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStackLimit[KERNEL_STACK_SIZE];
         struct
         {
-            UINT8 StackContents[KERNEL_STACK_SIZE - sizeof(PVOID) * 6];
+            UINT8 StackContents[KERNEL_STACK_SIZE - (sizeof(PVOID) * 6) - sizeof(KTRAP_FRAME)];
+            KTRAP_FRAME TrapFrame;
             UINT64 GuestVmcbPa;     // HostRsp
             UINT64 HostVmcbPa;
             struct _VIRTUAL_PROCESSOR_DATA* Self;
@@ -304,7 +306,11 @@ SvDebugPrint (
     va_list argList;
 
     va_start(argList, Format);
-    vDbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, Format, argList);
+    vDbgPrintExWithPrefix("[SimpleSvm] ",
+                          DPFLTR_IHVDRIVER_ID,
+                          DPFLTR_ERROR_LEVEL,
+                          Format,
+                          argList);
     va_end(argList);
 }
 
@@ -432,7 +438,7 @@ SvFreeContiguousMemory (
 /*!
     @brief          Injects #GP with 0 of error code.
 
-    @param[inout]   VpData - Per processor data.
+    @param[in,out]  VpData - Per processor data.
  */
 _IRQL_requires_same_
 static
@@ -469,8 +475,8 @@ SvInjectGeneralProtectionException (
                     https://msdn.microsoft.com/en-us/library/windows/hardware/Dn613994(v=vs.85).aspx
                     for details of the interface.
 
-    @param[inout]   VpData - Per processor data.
-    @param[inout]   GuestContext - Guest's GPRs.
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
  */
 _IRQL_requires_same_
 static
@@ -530,8 +536,8 @@ SvHandleCpuid (
             {
                 GuestContext->ExitVm = TRUE;
             }
-            break;
         }
+        break;
     default:
         break;
     }
@@ -557,7 +563,7 @@ SvHandleCpuid (
     //
     if (KeGetCurrentIrql() <= DISPATCH_LEVEL)
     {
-        SvDebugPrint("[SimpleSvm] CPUID: %08x-%08x : %08x %08x %08x %08x\n",
+        SvDebugPrint("CPUID: %08x-%08x : %08x %08x %08x %08x\n",
                      leaf,
                      subLeaf,
                      registers[0],
@@ -577,10 +583,11 @@ SvHandleCpuid (
                     instructions.
 
     @details        This protects EFER.SVME from being cleared by the guest by
-                    injecting #GP when it is about to be cleared.
+                    injecting #GP when it is about to be cleared. For other MSR
+                    access, it passes-through.
 
-    @param[inout]   VpData - Per processor data.
-    @param[inout]   GuestContext - Guest's GPRs.
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
  */
 _IRQL_requires_same_
 static
@@ -590,39 +597,91 @@ SvHandleMsrAccess (
     _Inout_ PGUEST_CONTEXT GuestContext
     )
 {
-    UINT64 writeValueLow, writeValueHi, writeValue;
+    ULARGE_INTEGER value;
+    UINT32 msr;
+    BOOLEAN writeAccess;
+
+    msr = GuestContext->VpRegs->Rcx & MAXUINT32;
+    writeAccess = (VpData->GuestVmcb.ControlArea.ExitInfo1 != 0);
 
     //
-    // #VMEXIT should only occur on write accesses to IA32_MSR_EFER. 1 of
-    // ExitInfo1 indicates a write access.
+    // If IA32_MSR_EFER is accessed for write, we must protect the EFER_SVME bit
+    // from being cleared.
     //
-    NT_ASSERT(GuestContext->VpRegs->Rcx == IA32_MSR_EFER);
-    NT_ASSERT(VpData->GuestVmcb.ControlArea.ExitInfo1 != 0);
-
-    writeValueLow = GuestContext->VpRegs->Rax & MAXUINT32;
-    if ((writeValueLow & EFER_SVME) == 0)
+    if (msr == IA32_MSR_EFER)
     {
         //
-        // Inject #GP if the guest attempts to clear the SVME bit. Protection of
-        // this bit is required because clearing the bit while guest is running
-        // leads to undefined behavior.
+        // #VMEXIT on IA32_MSR_EFER access should only occur on write access.
         //
-        SvInjectGeneralProtectionException(VpData);
-    }
+        NT_ASSERT(writeAccess != FALSE);
 
-    //
-    // Otherwise, update the MSR as requested. Important to note that the value
-    // should be checked not to allow any illegal values, and inject #GP as
-    // needed. Otherwise, the hypervisor attempts to resume the guest with an
-    // illegal EFER and immediately receives #VMEXIT due to VMEXIT_INVALID,
-    // which in our case, results in a bug check. See "Extended Feature Enable
-    // Register (EFER)" for what values are allowed.
-    //
-    // This code does not implement the check intentionally, for simplicity.
-    //
-    writeValueHi = GuestContext->VpRegs->Rdx & MAXUINT32;
-    writeValue = writeValueHi << 32 | writeValueLow;
-    VpData->GuestVmcb.StateSaveArea.Efer = writeValue;
+        value.LowPart = GuestContext->VpRegs->Rax & MAXUINT32;
+        value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
+        if ((value.QuadPart & EFER_SVME) == 0)
+        {
+            //
+            // Inject #GP if the guest attempts to clear the SVME bit. Protection of
+            // this bit is required because clearing the bit while guest is running
+            // leads to undefined behavior.
+            //
+            SvInjectGeneralProtectionException(VpData);
+        }
+
+        //
+        // Otherwise, update the MSR as requested. Important to note that the value
+        // should be checked not to allow any illegal values, and inject #GP as
+        // needed. Otherwise, the hypervisor attempts to resume the guest with an
+        // illegal EFER and immediately receives #VMEXIT due to VMEXIT_INVALID,
+        // which in our case, results in a bug check. See "Extended Feature Enable
+        // Register (EFER)" for what values are allowed.
+        //
+        // This code does not implement the check intentionally, for simplicity.
+        //
+        VpData->GuestVmcb.StateSaveArea.Efer = value.QuadPart;
+    }
+    else
+    {
+        //
+        // If the MSR being accessed is not IA32_MSR_EFER, assert that #VMEXIT
+        // can only occur on access to MSR outside the ranges controlled with
+        // the MSR permissions map. This is true because the map is configured
+        // not to intercept any MSR access but IA32_MSR_EFER. See
+        // "MSR Ranges Covered by MSRPM" in "MSR Intercepts" for the MSR ranges
+        // controlled by the map.
+        //
+        // Note that VMware Workstation has a bug that access to unimplemented
+        // MSRs unconditionally causes #VMEXIT ignoring bits in the MSR
+        // permissions map. This can be tested by reading MSR zero, for example.
+        //
+        NT_ASSERT(((msr > 0x00001fff) && (msr < 0xc0000000)) ||
+                  ((msr > 0xc0001fff) && (msr < 0xc0010000)) ||
+                   (msr > 0xc0011fff));
+
+        //
+        // Execute WRMSR or RDMSR on behalf of the guest. Important that this
+        // can cause bug check when the guest tries to access unimplemented MSR
+        // *even within the SEH block* because the below WRMSR or RDMSR raises
+        // #GP and are not protected by the SEH block (or cannot be protected
+        // either as this code run outside the thread stack region Windows
+        // requires to proceed SEH). Hypervisors typically handle this by noop-ing
+        // WRMSR and returning zero for RDMSR with non-architecturally defined
+        // MSRs. Alternatively, one can probe which MSRs should cause #GP prior
+        // to installation of a hypervisor and the hypervisor can emulate the
+        // results.
+        //
+        if (writeAccess != FALSE)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & MAXUINT32;
+            value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
+            __writemsr(msr, value.QuadPart);
+        }
+        else
+        {
+            value.QuadPart = __readmsr(msr);
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+    }
 
     //
     // Then, advance RIP to "complete" the instruction.
@@ -635,8 +694,8 @@ SvHandleMsrAccess (
 
     @details        This function always injects #GP to the guest.
 
-    @param[inout]   VpData - Per processor data.
-    @param[inout]   GuestContext - Guest's GPRs.
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestContext - Guest's GPRs.
  */
 _IRQL_requires_same_
 static
@@ -666,8 +725,8 @@ SvHandleVmrun (
                     hypervisor, this function loads guest state, disables SVM
                     and returns to execution flow where the #VMEXIT triggered.
 
-    @param[inout]   VpData - Per processor data.
-    @param[inout]   GuestRegisters - Guest's GPRs.
+    @param[in,out]  VpData - Per processor data.
+    @param[in,out]  GuestRegisters - Guest's GPRs.
 
     @result         TRUE when virtualization is terminated; otherwise FALSE.
  */
@@ -682,6 +741,9 @@ SvHandleVmExit (
 {
     GUEST_CONTEXT guestContext;
     KIRQL oldIrql;
+
+    guestContext.VpRegs = GuestRegisters;
+    guestContext.ExitVm = FALSE;
 
     //
     // Load some host state that are not loaded on #VMEXIT.
@@ -712,8 +774,13 @@ SvHandleVmExit (
     //
     GuestRegisters->Rax = VpData->GuestVmcb.StateSaveArea.Rax;
 
-    guestContext.VpRegs = GuestRegisters;
-    guestContext.ExitVm = FALSE;
+    //
+    // Update the _KTRAP_FRAME structure values in hypervisor stack, so that
+    // Windbg can reconstruct call stack of the guest during debug session.
+    // This is optional but very useful thing to do for debugging.
+    //
+    VpData->HostStackLayout.TrapFrame.Rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+    VpData->HostStackLayout.TrapFrame.Rip = VpData->GuestVmcb.ControlArea.NRip;
 
     //
     // Handle #VMEXIT according with its reason.
@@ -902,12 +969,13 @@ SvIsSimpleSvmHypervisorInstalled (
                 processor state, and enters the guest mode on the current
                 processor.
 
-    @param[inout] VpData - The address of per processor data.
-    @param[in]    SharedVpData - The address of share data.
-    @param[in]    ContextRecord - The address of CONETEXT to use as an initial
-                  context of the processor after it is virtualized.
+    @param[in,out]  VpData - The address of per processor data.
+    @param[in]      SharedVpData - The address of share data.
+    @param[in]      ContextRecord - The address of CONETEXT to use as an initial
+                    context of the processor after it is virtualized.
  */
-_IRQL_requires_(DISPATCH_LEVEL)
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
 _IRQL_requires_same_
 static
 VOID
@@ -1088,7 +1156,7 @@ SvVirtualizeProcessor (
                                                         'MVSS'));
     if (contextRecord == nullptr)
     {
-        SvDebugPrint("[SimpleSvm] Insufficient memory.\n");
+        SvDebugPrint("Insufficient memory.\n");
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
@@ -1103,7 +1171,7 @@ SvVirtualizeProcessor (
 #pragma prefast(pop)
     if (vpData == nullptr)
     {
-        SvDebugPrint("[SimpleSvm] Insufficient memory.\n");
+        SvDebugPrint("Insufficient memory.\n");
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
@@ -1126,7 +1194,7 @@ SvVirtualizeProcessor (
     //
     if (SvIsSimpleSvmHypervisorInstalled() == FALSE)
     {
-        SvDebugPrint("[SimpleSvm] Attempting to virtualize the processor.\n");
+        SvDebugPrint("Attempting to virtualize the processor.\n");
         sharedVpData = static_cast<PSHARED_VIRTUAL_PROCESSOR_DATA>(Context);
 
         //
@@ -1153,7 +1221,7 @@ SvVirtualizeProcessor (
         KeBugCheck(MANUALLY_INITIATED_CRASH);
     }
 
-    SvDebugPrint("[SimpleSvm] The processor has been virtualized.\n");
+    SvDebugPrint("The processor has been virtualized.\n");
     status = STATUS_SUCCESS;
 
 Exit:
@@ -1315,7 +1383,7 @@ SvDevirtualizeProcessor (
         goto Exit;
     }
 
-    SvDebugPrint("[SimpleSvm] The processor has been de-virtualized.\n");
+    SvDebugPrint("The processor has been de-virtualized.\n");
 
     //
     // Get an address of per processor data indicated by EDX:EAX.
@@ -1389,7 +1457,7 @@ SvDevirtualizeAllProcessors (
                     IA32_MSR_EFER and sets the MSB bit. For details of logic, see
                     "MSR Intercepts".
 
-    @param[inout]   MsrPermissionsMap - The MSRPM to set up.
+    @param[in,out]  MsrPermissionsMap - The MSRPM to set up.
  */
 _IRQL_requires_same_
 static
@@ -1655,7 +1723,7 @@ SvVirtualizeAllProcessors (
     //
     if (SvIsSvmSupported() == FALSE)
     {
-        SvDebugPrint("[SimpleSvm] SVM is not fully supported on this processor.\n");
+        SvDebugPrint("SVM is not fully supported on this processor.\n");
         status = STATUS_HV_FEATURE_UNAVAILABLE;
         goto Exit;
     }
@@ -1671,7 +1739,7 @@ SvVirtualizeAllProcessors (
 #pragma prefast(pop)
     if (sharedVpData == nullptr)
     {
-        SvDebugPrint("[SimpleSvm] Insufficient memory.\n");
+        SvDebugPrint("Insufficient memory.\n");
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
@@ -1683,7 +1751,7 @@ SvVirtualizeAllProcessors (
                                                     SVM_MSR_PERMISSIONS_MAP_SIZE);
     if (sharedVpData->MsrPermissionsMap == nullptr)
     {
-        SvDebugPrint("[SimpleSvm] Insufficient memory.\n");
+        SvDebugPrint("Insufficient memory.\n");
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto Exit;
     }
@@ -1800,7 +1868,7 @@ DriverEntry (
     status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
-        SvDebugPrint("[SimpleSvm] Failed to open the power state callback object.\n");
+        SvDebugPrint("Failed to open the power state callback object.\n");
         goto Exit;
     }
 
@@ -1814,7 +1882,7 @@ DriverEntry (
     ObDereferenceObject(callbackObject);
     if (callbackRegistration == nullptr)
     {
-        SvDebugPrint("[SimpleSvm] Failed to register a power state callback.\n");
+        SvDebugPrint("Failed to register a power state callback.\n");
         status = STATUS_UNSUCCESSFUL;
         goto Exit;
     }
